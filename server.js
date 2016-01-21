@@ -5,14 +5,16 @@
 var request = require('request'),
     url = require('url'),
     fs = require('fs'),
+    http = require('http'),
+    https = require('https'),
     express = require('express'),
-    socket_io = require('socket.io'),
     util = require('util'),
     querystring = require('querystring'),
     vm = require('vm');
 
 var channels = {},
     authenticatedClients = {},
+    sockets = {},
     onlineUsers = {},
     presenceTimeoutIds = {},
     contentChannelTimeoutIds = {},
@@ -31,6 +33,7 @@ var channels = {},
       addUserToChannelUrl: 'user/channel/add/:channel/:uid',
       removeUserFromChannelUrl: 'user/channel/remove/:channel/:uid',
       addChannelUrl: 'channel/add/:channel',
+      checkChannelUrl: 'channel/check/:channel',
       removeChannelUrl: 'channel/remove/:channel',
       setUserPresenceListUrl: 'user/presence-list/:uid/:uidList',
       addAuthTokenToChannelUrl: 'authtoken/channel/add/:channel/:uid',
@@ -42,7 +45,7 @@ var channels = {},
       extensions: [],
       clientsCanWriteToChannels: false,
       clientsCanWriteToClients: false,
-      transports: ['websocket', 'flashsocket', 'htmlfile', 'xhr-polling', 'jsonp-polling'],
+      transports: ['websocket', 'polling'],
       jsMinification: true,
       jsEtag: true,
       backend: {
@@ -50,19 +53,26 @@ var channels = {},
         scheme: 'http',
         port: 80,
         basePath: '/',
-        messagePath: 'nodejs/message'
+        strictSSL: false,
+        messagePath: 'nodejs/message',
+        httpAuth: ''
       },
       logLevel: 1
     },
     extensions = [];
 
+var configFile = process.cwd() + '/nodejs.config.js';
+if (process.argv[2]) {
+  configFile = process.argv[2];
+}
 try {
-  var settings = vm.runInThisContext(fs.readFileSync(process.cwd() + '/nodejs.config.js'));
+  var settings = vm.runInThisContext(fs.readFileSync(configFile));
 }
 catch (exception) {
   console.log("Failed to read config file, exiting: " + exception);
   process.exit(1);
 }
+
 for (var key in settingsDefaults) {
   if (key != 'backend' && !settings.hasOwnProperty(key)) {
     settings[key] = settingsDefaults[key];
@@ -95,6 +105,25 @@ for (var i in settings.extensions) {
 }
 
 /**
+ * Invokes the specified function on all registered server extensions.
+ */
+var invokeExtensions = function (hook) {
+  var args = arguments.length ? Array.prototype.slice.call(arguments, 1) : [];
+  var returnValues = {};
+  for (var i in extensions) {
+    if (extensions[i].hasOwnProperty(hook) && extensions[i][hook].apply) {
+      returnValues[i] = extensions[i][hook].apply(this, args);
+    }
+  }
+  return returnValues;
+}
+
+/**
+ * Allow extensions to alter the settings.
+ */
+invokeExtensions('settingsAlter', settings);
+
+/**
  * Check if the given channel is client-writable.
  */
 var channelIsClientWritable = function (channel) {
@@ -105,11 +134,28 @@ var channelIsClientWritable = function (channel) {
 }
 
 /**
+ * Check if the given socket is in the given channel.
+ */
+var clientIsInChannel = function (socket, channel) {
+  if (!channels.hasOwnProperty(channel)) {
+    return false;
+  }
+  return channels[channel].sessionIds[socket.id];
+}
+
+/**
  * Returns the backend url.
  */
 var getBackendUrl = function () {
   return settings.backend.scheme + '://' + settings.backend.host + ':' +
          settings.backend.port + settings.backend.basePath + settings.backend.messagePath;
+}
+
+var getAuthHeader = function() {
+  if (settings.backend.httpAuth.length > 0) {
+    return 'Basic ' + new Buffer(settings.backend.httpAuth).toString('base64');
+  }
+  return false;
 }
 
 /**
@@ -128,6 +174,15 @@ var sendMessageToBackend = function (message, callback) {
       'Content-Length': Buffer.byteLength(requestBody),
       'Content-Type': 'application/x-www-form-urlencoded'
     }
+  }
+
+  if (settings.backend.scheme == 'https') {
+     options.strictSSL = settings.backend.strictSSL;
+  }
+
+  var httpAuthHeader = getAuthHeader();
+  if (httpAuthHeader !== false) {
+    options.headers.Authorization = httpAuthHeader;
   }
 
   if (settings.debug) {
@@ -211,7 +266,7 @@ var sendPresenceChangeNotification = function (uid, presenceEvent) {
         console.log('Sending presence notification for', uid, 'to', onlineUsers[uid][i]);
       }
       for (var j in sessionIds) {
-        io.sockets.socket(sessionIds[j]).json.send({'presenceNotification': {'uid': uid, 'event': presenceEvent}});
+        sockets[sessionIds[j]].json.send({'presenceNotification': {'uid': uid, 'event': presenceEvent}});
       }
     }
   }
@@ -396,8 +451,8 @@ var publishMessageToContentChannel = function (request, response) {
  * Publish a message to a specific client.
  */
 var publishMessageToClient = function (sessionId, message) {
-  if (io.sockets.sockets[sessionId]) {
-    io.sockets.socket(sessionId).json.send(message);
+  if (sockets[sessionId]) {
+    sockets[sessionId].json.send(message);
     if (settings.debug) {
       console.log('Sent message to client ' + sessionId);
     }
@@ -427,9 +482,9 @@ var kickUser = function (request, response) {
       }
     }
     // Destroy any socket connections associated with this uid.
-    for (var clientId in io.sockets.sockets) {
-      if (io.sockets.sockets[clientId].uid == request.params.uid) {
-        delete io.sockets.sockets[clientId];
+    for (var clientId in sockets) {
+      if (sockets[clientId].uid == request.params.uid) {
+        delete sockets[clientId];
         if (settings.debug) {
           console.log('kickUser: deleted socket "' + clientId + '" for uid "' + request.params.uid + '"');
         }
@@ -457,13 +512,9 @@ var logoutUser = function (request, response) {
     delete authenticatedClients[authToken];
 
     // Destroy any socket connections associated with this authToken.
-    for (var clientId in io.sockets.sockets) {
-      if (io.sockets.sockets[clientId].authToken == authToken) {
-        delete io.sockets.sockets[clientId];
-        // Delete any channel entries for this clientId.
-        for (var channel in channels) {
-          delete channels[channel].sessionIds[clientId];
-        }
+    for (var clientId in sockets) {
+      if (sockets[clientId].authToken == authToken) {
+        cleanupSocket(sockets[clientId]);
       }
     }
     response.send({'status': 'success'});
@@ -479,11 +530,11 @@ var logoutUser = function (request, response) {
 var getContentTokenChannelUsers = function (channel) {
   var users = {uids: [], authTokens: []};
   for (var sessionId in tokenChannels[channel].sockets) {
-    if (io.sockets.sockets[sessionId].uid) {
-      users.uids.push(io.sockets.sockets[sessionId].uid);
+    if (sockets[sessionId].uid) {
+      users.uids.push(sockets[sessionId].uid);
     }
     else {
-      users.authTokens.push(io.sockets.sockets[sessionId].authToken);
+      users.authTokens.push(sockets[sessionId].authToken);
     }
   }
   return users;
@@ -494,8 +545,8 @@ var getContentTokenChannelUsers = function (channel) {
  */
 var getNodejsSessionIdsFromUid = function (uid) {
   var sessionIds = [];
-  for (var sessionId in io.sockets.sockets) {
-    if (io.sockets.sockets[sessionId].uid == uid) {
+  for (var sessionId in sockets) {
+    if (sockets[sessionId].uid == uid) {
       sessionIds.push(sessionId);
     }
   }
@@ -510,8 +561,8 @@ var getNodejsSessionIdsFromUid = function (uid) {
  */
 var getNodejsSessionIdsFromAuthToken = function (authToken) {
   var sessionIds = [];
-  for (var sessionId in io.sockets.sockets) {
-    if (io.sockets.sockets[sessionId].authToken == authToken) {
+  for (var sessionId in sockets) {
+    if (sockets[sessionId].authToken == authToken) {
       sessionIds.push(sessionId);
     }
   }
@@ -620,7 +671,7 @@ var addAuthTokenToChannel = function (request, response) {
  */
 var addClientToChannel = function (sessionId, channel) {
   if (sessionId && channel) {
-    if (!/^[0-9]+$/.test(sessionId) || !io.sockets.sockets.hasOwnProperty(sessionId)) {
+    if (!/^[0-9a-z_-]+$/i.test(sessionId) || !sockets.hasOwnProperty(sessionId)) {
       console.log("addClientToChannel: Invalid sessionId: " + sessionId);
     }
     else if (!/^[a-z0-9_]+$/i.test(channel)) {
@@ -692,6 +743,33 @@ var addChannel = function (request, response) {
       console.log("Successfully added channel '" + channel + "'");
     }
     response.send({'status': 'success'});
+  }
+  else {
+    console.log("Missing channel");
+    response.send({'status': 'failed', 'error': 'Invalid data: missing channel'});
+  }
+}
+
+/**
+ * Checks whether a channel exists.
+ */
+var checkChannel = function (request, response) {
+  var channel = request.params.channel || '';
+  if (channel) {
+    if (!/^[a-z0-9_]+$/i.test(channel)) {
+      console.log('Invalid channel: ' + channel);
+      response.send({'status': 'failed', 'error': 'Invalid channel name.'});
+      return;
+    }
+    if (channels[channel]) {
+      console.log("Channel name '" + channel + "' is active on the server.");
+      response.send({'status': 'success', 'result': true});
+      return;
+    }
+    else {
+      console.log("Channel name '" + channel + "' is not active on the server.");
+      response.send({'status': 'success', 'result': false});
+    }
   }
   else {
     console.log("Missing channel");
@@ -800,7 +878,7 @@ var removeAuthTokenFromChannel = function (request, response) {
  */
 var removeClientFromChannel = function (sessionId, channel) {
   if (sessionId && channel) {
-    if (!/^[0-9]+$/.test(sessionId) || !io.sockets.sockets.hasOwnProperty(sessionId)) {
+    if (!/^[0-9a-z_-]+$/i.test(sessionId) || !sockets.hasOwnProperty(sessionId)) {
       console.log("removeClientFromChannel: Invalid sessionId: " + sessionId);
     }
     else if (!/^[a-z0-9_]+$/i.test(channel) || !channels.hasOwnProperty(channel)) {
@@ -884,7 +962,7 @@ var cleanupSocket = function (socket) {
     }
   }
 
-  delete io.sockets.sockets[socket.id];
+  delete sockets[socket.id];
 }
 
 /**
@@ -974,16 +1052,15 @@ var setContentToken = function (request, response) {
 }
 
 /**
- * Setup a io.sockets.sockets{}.connection with uid, channels etc.
+ * Setup a sockets{}.connection with uid, channels etc.
  */
 var setupClientConnection = function (sessionId, authData, contentTokens) {
-  if (!io.sockets.sockets[sessionId]) {
+  if (!sockets[sessionId]) {
     console.log("Client socket '" + sessionId + "' went away.");
-    console.log(authData);
     return;
   }
-  io.sockets.sockets[sessionId].authToken = authData.authToken;
-  io.sockets.sockets[sessionId].uid = authData.uid;
+  sockets[sessionId].authToken = authData.authToken;
+  sockets[sessionId].uid = authData.uid;
   for (var i in authData.channels) {
     channels[authData.channels[i]] = channels[authData.channels[i]] || {'sessionIds': {}};
     channels[authData.channels[i]].sessionIds[sessionId] = sessionId;
@@ -1018,6 +1095,23 @@ var setupClientConnection = function (sessionId, authData, contentTokens) {
   }
 };
 
+var app = express();
+app.all(settings.baseAuthPath + '*', checkServiceKeyCallback);
+app.post(settings.baseAuthPath + settings.publishUrl, publishMessage);
+app.get(settings.baseAuthPath + settings.kickUserUrl, kickUser);
+app.get(settings.baseAuthPath + settings.logoutUserUrl, logoutUser);
+app.get(settings.baseAuthPath + settings.addUserToChannelUrl, addUserToChannel);
+app.get(settings.baseAuthPath + settings.removeUserFromChannelUrl, removeUserFromChannel);
+app.get(settings.baseAuthPath + settings.addChannelUrl, addChannel);
+app.get(settings.baseAuthPath + settings.checkChannelUrl, checkChannel);
+app.get(settings.baseAuthPath + settings.removeChannelUrl, removeChannel);
+app.get(settings.baseAuthPath + settings.setUserPresenceListUrl, setUserPresenceList);
+app.post(settings.baseAuthPath + settings.toggleDebugUrl, toggleDebug);
+app.post(settings.baseAuthPath + settings.getContentTokenUsersUrl, getContentTokenUsers);
+app.post(settings.baseAuthPath + settings.contentTokenUrl, setContentToken);
+app.post(settings.baseAuthPath + settings.publishMessageToContentChannelUrl, publishMessageToContentChannel);
+app.get('*', send404);
+
 var server;
 if (settings.scheme == 'https') {
   var sslOptions = {
@@ -1027,41 +1121,56 @@ if (settings.scheme == 'https') {
   if (settings.sslCAPath) {
     sslOptions.ca = fs.readFileSync(settings.sslCAPath);
   }
-  server = express.createServer(sslOptions);
+  if (settings.sslPassPhrase) {
+    sslOptions.passphrase = settings.sslPassPhrase;
+  }
+  server = https.createServer(sslOptions, app);
 }
 else {
-  server = express.createServer();
+  server = http.createServer(app);
 }
-server.all(settings.baseAuthPath + '*', checkServiceKeyCallback);
-server.post(settings.baseAuthPath + settings.publishUrl, publishMessage);
-server.get(settings.baseAuthPath + settings.kickUserUrl, kickUser);
-server.get(settings.baseAuthPath + settings.logoutUserUrl, logoutUser);
-server.get(settings.baseAuthPath + settings.addUserToChannelUrl, addUserToChannel);
-server.get(settings.baseAuthPath + settings.removeUserFromChannelUrl, removeUserFromChannel);
-server.get(settings.baseAuthPath + settings.addChannelUrl, addChannel);
-server.get(settings.baseAuthPath + settings.removeChannelUrl, removeChannel);
-server.get(settings.baseAuthPath + settings.setUserPresenceListUrl, setUserPresenceList);
-server.post(settings.baseAuthPath + settings.toggleDebugUrl, toggleDebug);
-server.post(settings.baseAuthPath + settings.getContentTokenUsersUrl, getContentTokenUsers);
-server.post(settings.baseAuthPath + settings.contentTokenUrl, setContentToken);
-server.post(settings.baseAuthPath + settings.publishMessageToContentChannelUrl, publishMessageToContentChannel);
-server.get('*', send404);
+
+// Allow extensions to add routes.
+var path = '';
+for (var i in extensions) {
+  if (extensions[i].hasOwnProperty('routes')) {
+    console.log('Adding route handlers from extension', extensions[i].routes);
+    for (var j = 0; j < extensions[i].routes.length; j++) {
+      if (extensions[i].routes[j].auth) {
+        path = settings.baseAuthPath + extensions[i].routes[j].path;
+      }
+      else {
+        path = extensions[i].routes[j].path;
+      }
+      if (extensions[i].routes[j].type == 'post') {
+        server.post(path, extensions[i].routes[j].handler);
+      }
+      else {
+        server.get(path, extensions[i].routes[j].handler);
+      }
+    }
+  }
+}
+
 server.listen(settings.port, settings.host);
 console.log('Started ' + settings.scheme + ' server.');
 
-var io = socket_io.listen(server, {port: settings.port, resource: settings.resource});
-io.configure(function () {
-  io.set('transports', settings.transports);
-  io.set('log level', settings.logLevel);
-  if (settings.jsEtag) {
-    io.enable('browser client etag');
-  }
-  if (settings.jsMinification) {
-    io.enable('browser client minification');
-  }
-});
+var io_options = {};
+io_options['transports'] = settings.transports;
+io_options['log level'] = settings.logLevel;
+io_options['port'] = settings.port;
+if (settings.jsEtag) {
+  io_options['browser client etag'] = true;
+}
+if (settings.jsMinification) {
+  io_options['browser client minification'] = true;
+}
 
-io.sockets.on('connection', function(socket) {
+var io = require('socket.io')(server, io_options);
+io.set('resource', settings.resource);
+io.set('transports', settings.transports);
+io.on('connection', function(socket) {
+  sockets[socket.id] = socket;
   process.emit('client-connection', socket.id);
 
   socket.on('authenticate', function(message) {
@@ -1073,16 +1182,20 @@ io.sockets.on('connection', function(socket) {
 
   socket.on('message', function(message) {
     // If the message is from an active client, then process it.
-    if (io.sockets.sockets[socket.id] && message.hasOwnProperty('type')) {
+    if (sockets[socket.id] && message.hasOwnProperty('type')) {
       if (settings.debug) {
         console.log('Received message from client ' + socket.id);
       }
 
-      // If this message is destined for a channel, check that writing to
-      // channels from client sockets is allowed.
+      // If this message is destined for a channel, check two things:
+      // - that this channel is allowed to get messages directly from clients
+      // - that the sending socket is already in this channel (that is, the
+      // backend has sent this channel in this user's allowed list).
+      // Do not let extensions using this feature accidentally allow sending
+      // of messages to any socket on any channel.
       if (message.hasOwnProperty('channel')) {
-        if (settings.clientsCanWriteToChannels || channelIsClientWritable(message.channel)) {
-          process.emit('client-message', socket.id, message);
+        if (channelIsClientWritable(message.channel) && clientIsInChannel(socket, message.channel)) {
+          process.emit('client-to-channel-message', socket.id, message);
         }
         else if (settings.debug) {
           console.log('Received unauthorised message from client: cannot write to channel ' + socket.id);
@@ -1091,8 +1204,8 @@ io.sockets.on('connection', function(socket) {
 
       // No channel, so this message is destined for one or more clients. Check
       // that this is allowed in the server configuration.
-      if (settings.clientsCanWriteToClients) {
-        process.emit('client-message', socket.id, message);
+      else if (settings.clientsCanWriteToClients) {
+        process.emit('client-to-client-message', socket.id, message);
       }
       else if (settings.debug) {
         console.log('Received unauthorised message from client: cannot write to client ' + socket.id);
@@ -1111,18 +1224,6 @@ io.sockets.on('connection', function(socket) {
 });
 
 /**
- * Invokes the specified function on all registered server extensions.
- */
-var invokeExtensions = function (hook) {
-  var args = arguments.length ? Array.prototype.slice.call(arguments, 1) : [];
-  for (var i in extensions) {
-    if (extensions[i].hasOwnProperty(hook) && extensions[i][hook].apply) {
-      extensions[i][hook].apply(this, args);
-    }
-  }
-}
-
-/**
  * Define a configuration object to pass to all server extensions at
  * initialization. The extensions do not have access to this namespace,
  * so we provide them with references.
@@ -1130,14 +1231,17 @@ var invokeExtensions = function (hook) {
 var extensionsConfig = {
   'publishMessageToChannel': publishMessageToChannel,
   'publishMessageToClient': publishMessageToClient,
+  'publishMessageToContentChannel': publishMessageToContentChannel,
   'addClientToChannel': addClientToChannel,
   'settings': settings,
   'channels': channels,
   'io': io,
   'tokenChannels': tokenChannels,
+  'authenticatedClients': authenticatedClients,
+  'request': request,
+  'server': server,
   'sendMessageToBackend': sendMessageToBackend
 };
 invokeExtensions('setup', extensionsConfig);
 
 // vi:ai:expandtab:sw=2 ts=2
-

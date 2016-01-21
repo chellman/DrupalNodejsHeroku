@@ -10,7 +10,7 @@ settings = {
     scheme: 'http',
     messagePath: '/nodejs/message'
   },
-  transports: ['xhr-polling'],
+  transports: ['xhr-polling', 'polling', 'websocket'],
   debug: true
 };
 
